@@ -42,7 +42,7 @@ template DualMux() {
 template Withdraw(levels) {
     // Public Inputs
     signal input root;          // The actual on-chain Merkle Root of all deposits
-    signal input subsetRoot;    // The root of the "Clean Tree" (Blocklist applied)
+    signal input subsetRoot;    // The root of the "Clean Tree" (Allowlist or Blocklist complement)
     signal input nullifierHash; // To prevent double spending
     signal input recipient;     // Address to receive funds (binding to prevent front-running)
     signal input relayer;       // Address of relayer (binding)
@@ -55,7 +55,9 @@ template Withdraw(levels) {
     signal input pathElements[levels];      // Path in the Main Tree
     signal input pathIndices[levels];       // Indices in the Main Tree
     signal input subsetPathElements[levels]; // Path in the Subset Tree
-    // Note: pathIndices are the same for both trees because the leaf position doesn't change!
+    
+    // Note: pathIndices are the same for both trees because the leaf position 
+    // is identical in the main tree and the subset tree (sparse tree).
 
     // 1. Verify Leaf Construction
     component hasher = Poseidon(2);
@@ -69,6 +71,7 @@ template Withdraw(levels) {
     nullifierHasher.out === nullifierHash;
 
     // 3. Verify Membership in Main Tree (Standard Tornado)
+    // This proves the deposit actually exists in the history of the protocol.
     component mainTree = MerkleProof(levels);
     mainTree.leaf <== leaf;
     for (var i = 0; i < levels; i++) {
@@ -77,24 +80,27 @@ template Withdraw(levels) {
     }
     mainTree.root === root;
 
-    // 4. Verify Membership in Subset Tree (The "Safe" Part)
+    // 4. Verify Membership in Subset Tree (The "Privacy Pool" Logic)
+    // This proves: "My leaf exists in the tree defined by subsetRoot".
+    // 
+    // How this works for "Any Set of Lists":
+    // The subsetRoot should be the Merkle Root of a tree that contains 
+    // ONLY the "allowed" deposits (or the complement of "blocked" deposits).
+    // By proving your leaf is in this tree, you prove you are part of that specific subset.
+    //
+    // Since we use the SAME leaf and SAME pathIndices as the main tree,
+    // we effectively prove: Leaf is in (Main Tree AND Subset Tree).
     component subsetTree = MerkleProof(levels);
-    subsetTree.leaf <== leaf; // CRITICAL: Must use the SAME leaf
+    subsetTree.leaf <== leaf; 
     for (var i = 0; i < levels; i++) {
         subsetTree.pathElements[i] <== subsetPathElements[i];
-        subsetTree.pathIndices[i] <== pathIndices[i]; // Indices must be identical
+        subsetTree.pathIndices[i] <== pathIndices[i]; 
     }
     subsetTree.root === subsetRoot;
 
-    // 5. Square Constraints for Public Bindings (Prevent tampering)
-    component txHasher = Poseidon(5);
-    txHasher.inputs[0] <== recipient;
-    txHasher.inputs[1] <== relayer;
-    txHasher.inputs[2] <== fee;
-    txHasher.inputs[3] <== refund;
-    txHasher.inputs[4] <== nullifierHash;
-    // The output is not checked here, but binds the inputs to the proof generation 
-    // if this hash is used in the solidity verifier or signal aggregation.
+    // 5. Binding Constraints
+    // In this implementation, we use the public inputs directly.
+    // The Verifier contract MUST ensure `recipient`, `relayer`, etc., match the transaction.
 }
 
 component main {public [root, subsetRoot, nullifierHash, recipient, relayer, fee, refund]} = Withdraw(20);
