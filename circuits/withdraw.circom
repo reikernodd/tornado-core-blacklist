@@ -1,7 +1,7 @@
 pragma circom 2.0.0;
 
 include "circomlib/circuits/poseidon.circom";
-include "circomlib/circuits/merkleTree.circom";
+// include "circomlib/circuits/merkleTree.circom";
 
 // MerkleProof verification template
 template MerkleProof(levels) {
@@ -15,7 +15,7 @@ template MerkleProof(levels) {
 
     for (var i = 0; i < levels; i++) {
         selectors[i] = DualMux();
-        selectors[i].in[0] <== i == 0 ? leaf : hashers[i - 1].hash;
+        selectors[i].in[0] <== i == 0 ? leaf : hashers[i - 1].out;
         selectors[i].in[1] <== pathElements[i];
         selectors[i].s <== pathIndices[i];
 
@@ -24,7 +24,7 @@ template MerkleProof(levels) {
         hashers[i].inputs[1] <== selectors[i].out[1];
     }
 
-    root <== hashers[levels - 1].hash;
+    root <== hashers[levels - 1].out;
 }
 
 // DualMux helper for MerkleProof
@@ -63,7 +63,7 @@ template Withdraw(levels) {
     component hasher = Poseidon(2);
     hasher.inputs[0] <== nullifier;
     hasher.inputs[1] <== secret;
-    signal leaf <== hasher.hash;
+    signal leaf <== hasher.out;
 
     // 2. Verify Nullifier Hash
     component nullifierHasher = Poseidon(1);

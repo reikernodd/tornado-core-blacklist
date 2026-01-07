@@ -9,7 +9,7 @@ const rpcUrl = 'https://mainnet.infura.io'
 const Web3 = require('web3')
 const web3 = new Web3(rpcUrl)
 
-const contractData = require('./build/contracts/' + (eth ? 'ETHTornado.json' : 'ERC20Tornado.json'))
+const contractData = require(`./build/contracts/${eth ? 'ETHTornado.json' : 'ERC20Tornado.json'}`)
 const contract = new web3.eth.Contract(contractData.abi)
 const bytes = contract
   .deploy({

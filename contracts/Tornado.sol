@@ -16,7 +16,7 @@ import "./MerkleTreeWithHistory.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 interface IVerifier {
-  function verifyProof(bytes memory _proof, uint256[6] memory _input) external returns (bool);
+  function verifyProof(uint[2] memory _pA, uint[2][2] memory _pB, uint[2] memory _pC, uint[7] memory _input) external view returns (bool);
 }
 
 abstract contract Tornado is MerkleTreeWithHistory, ReentrancyGuard {
@@ -30,7 +30,7 @@ abstract contract Tornado is MerkleTreeWithHistory, ReentrancyGuard {
 
   event Deposit(bytes32 indexed commitment, uint32 leafIndex, uint256 timestamp);
   event Revoked(bytes32 indexed commitment, uint32 leafIndex, uint256 timestamp);
-  event Withdrawal(address to, bytes32 nullifierHash, address indexed relayer, uint256 fee);
+  event Withdrawal(address to, bytes32 nullifierHash, address indexed relayer, uint256 fee, bytes32 subsetRoot);
 
   /**
     @dev The constructor
@@ -172,8 +172,11 @@ abstract contract Tornado is MerkleTreeWithHistory, ReentrancyGuard {
       - optional fee that goes to the transaction sender (usually a relay)
   */
   function withdraw(
-    bytes calldata _proof,
+    uint[2] calldata _pA,
+    uint[2][2] calldata _pB,
+    uint[2] calldata _pC,
     bytes32 _root,
+    bytes32 _subsetRoot,
     bytes32 _nullifierHash,
     address payable _recipient,
     address payable _relayer,
@@ -183,17 +186,30 @@ abstract contract Tornado is MerkleTreeWithHistory, ReentrancyGuard {
     require(_fee <= denomination, "Fee exceeds transfer value");
     require(!nullifierHashes[_nullifierHash], "The note has been already spent");
     require(isKnownRoot(_root), "Cannot find your merkle root"); // Make sure to use a recent one
+    
+    // Note: We do NOT verify _subsetRoot against contract storage. 
+    // It is "permissionless". The user can prove against ANY root.
+    // It is up to the recipient/community to check if the emitted _subsetRoot is valid/trusted.
+
     require(
       verifier.verifyProof(
-        _proof,
-        [uint256(_root), uint256(_nullifierHash), uint256(_recipient), uint256(_relayer), _fee, _refund]
+        _pA, _pB, _pC,
+        [
+            uint256(_root), 
+            uint256(_subsetRoot), 
+            uint256(_nullifierHash), 
+            uint256(_recipient), 
+            uint256(_relayer), 
+            _fee, 
+            _refund
+        ]
       ),
       "Invalid withdraw proof"
     );
 
     nullifierHashes[_nullifierHash] = true;
     _processWithdraw(_recipient, _relayer, _fee, _refund);
-    emit Withdrawal(_recipient, _nullifierHash, _relayer, _fee);
+    emit Withdrawal(_recipient, _nullifierHash, _relayer, _fee, _subsetRoot);
   }
 
   /** @dev this function is defined in a child contract */

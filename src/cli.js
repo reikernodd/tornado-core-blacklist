@@ -12,11 +12,12 @@ const circomlib = require('circomlib')
 const bigInt = snarkjs.bigInt
 const merkleTree = require('fixed-merkle-tree')
 const Web3 = require('web3')
-const buildGroth16 = require('websnark/src/groth16')
-const websnarkUtils = require('websnark/src/utils')
+// const buildGroth16 = require('websnark/src/groth16')
+// const websnarkUtils = require('websnark/src/utils')
 const { toWei, fromWei, toBN, BN } = require('web3-utils')
 const config = require('./config')
 const program = require('commander')
+const { buildSubsetTree } = require('./privacy_pool') // Import the helper
 
 let web3, tornado, circuit, proving_key, groth16, erc20, senderAccount, netId
 let MERKLE_TREE_HEIGHT, ETH_AMOUNT, TOKEN_AMOUNT, PRIVATE_KEY
@@ -28,25 +29,12 @@ let isLocalRPC = false
 /** Generate random number of specified byte length */
 const rbigint = nbytes => snarkjs.bigInt.leBuff2int(crypto.randomBytes(nbytes))
 
-/** Compute pedersen hash */
-const pedersenHash = data => circomlib.babyJub.unpackPoint(circomlib.pedersenHash.hash(data))[0]
-
-/** BigNumber to hex string of specified length */
-function toHex(number, length = 32) {
-  const str = number instanceof Buffer ? number.toString('hex') : bigInt(number).toString(16)
-  return '0x' + str.padStart(length * 2, '0')
-}
-
-/** Display ETH account balance */
-async function printETHBalance({ address, name }) {
-  console.log(`${name} ETH balance is`, web3.utils.fromWei(await web3.eth.getBalance(address)))
-}
-
-/** Display ERC20 account balance */
-async function printERC20Balance({ address, name, tokenAddress }) {
-  const erc20ContractJson = require(__dirname + '/../build/contracts/ERC20Mock.json')
-  erc20 = tokenAddress ? new web3.eth.Contract(erc20ContractJson.abi, tokenAddress) : erc20
-  console.log(`${name} Token Balance is`, web3.utils.fromWei(await erc20.methods.balanceOf(address).call()))
+const path = require('path')
+const poseidon = require(path.join(__dirname, '../node_modules/fixed-merkle-tree/node_modules/circomlib/src/poseidon.js'))
+/** Compute poseidon hash */
+const poseidonHash = (...args) => {
+  const inputs = args.length === 1 && Array.isArray(args[0]) ? args[0] : args
+  return poseidon(inputs)
 }
 
 /**
@@ -54,10 +42,9 @@ async function printERC20Balance({ address, name, tokenAddress }) {
  */
 function createDeposit({ nullifier, secret }) {
   const deposit = { nullifier, secret }
-  deposit.preimage = Buffer.concat([deposit.nullifier.leInt2Buff(31), deposit.secret.leInt2Buff(31)])
-  deposit.commitment = pedersenHash(deposit.preimage)
+  deposit.commitment = poseidonHash([deposit.nullifier, deposit.secret])
   deposit.commitmentHex = toHex(deposit.commitment)
-  deposit.nullifierHash = pedersenHash(deposit.nullifier.leInt2Buff(31))
+  deposit.nullifierHash = poseidonHash([deposit.nullifier])
   deposit.nullifierHex = toHex(deposit.nullifierHash)
   return deposit
 }
@@ -112,14 +99,16 @@ async function deposit({ currency, amount }) {
  * in it and generates merkle proof
  * @param deposit Deposit object
  */
-async function generateMerkleProof(deposit) {
+async function generateMerkleProof(deposit, blockedCommitments = []) {
   // Get all deposit events from smart contract and assemble merkle tree from them
   console.log('Getting current state from tornado contract')
   const events = await tornado.getPastEvents('Deposit', { fromBlock: 0, toBlock: 'latest' })
+  
+  // 1. MAIN TREE CONSTRUCTION
   const leaves = events
     .sort((a, b) => a.returnValues.leafIndex - b.returnValues.leafIndex) // Sort events in chronological order
     .map(e => e.returnValues.commitment)
-  const tree = new merkleTree(MERKLE_TREE_HEIGHT, leaves)
+  const tree = new merkleTree(MERKLE_TREE_HEIGHT, leaves, { hashFunction: poseidonHash, zeroElement: '21663839004416932945382355908790599225266501822907911457504978515578255421292' })
 
   // Find current commitment in the tree
   const depositEvent = events.find(e => e.returnValues.commitment === toHex(deposit.commitment))
@@ -133,9 +122,36 @@ async function generateMerkleProof(deposit) {
   assert(isSpent === false, 'The note is already spent')
   assert(leafIndex >= 0, 'The deposit is not found in the tree')
 
-  // Compute merkle proof of our commitment
+  // Compute merkle proof of our commitment for MAIN TREE
   const { pathElements, pathIndices } = tree.path(leafIndex)
-  return { pathElements, pathIndices, root: tree.root() }
+
+  // 2. SUBSET TREE CONSTRUCTION (Privacy Pool)
+  // We use the same events, but we filter out the blocked commitments.
+  // Note: blockedCommitments should be an array of hex strings.
+  console.log(`Building subset tree. Blocklist size: ${blockedCommitments.length}`)
+  
+  // buildSubsetTree is imported from src/privacy_pool.js
+  const subsetTree = buildSubsetTree(events, blockedCommitments, MERKLE_TREE_HEIGHT)
+  
+  // Verify we are not blocked
+  if (blockedCommitments.includes(toHex(deposit.commitment))) {
+    throw new Error("Cannot withdraw: Your deposit is in the blocklist!")
+  }
+
+  // Generate path in subset tree
+  // CRITICAL: We use the same leafIndex because the trees are parallel/sparse
+  const { pathElements: subsetPathElements } = subsetTree.path(leafIndex)
+  const subsetRoot = subsetTree.root()
+
+  console.log('Subset Root:', toHex(subsetRoot))
+
+  return { 
+      pathElements, 
+      pathIndices, 
+      root: tree.root(),
+      subsetRoot,
+      subsetPathElements
+  }
 }
 
 /**
@@ -146,14 +162,15 @@ async function generateMerkleProof(deposit) {
  * @param fee Relayer fee
  * @param refund Receive ether for exchanged tokens
  */
-async function generateProof({ deposit, recipient, relayerAddress = 0, fee = 0, refund = 0 }) {
+async function generateProof({ deposit, recipient, relayerAddress = 0, fee = 0, refund = 0, blockedCommitments = [] }) {
   // Compute merkle proof of our commitment
-  const { root, pathElements, pathIndices } = await generateMerkleProof(deposit)
+  const { root, pathElements, pathIndices, subsetRoot, subsetPathElements } = await generateMerkleProof(deposit, blockedCommitments)
 
   // Prepare circuit input
   const input = {
     // Public snark inputs
     root: root,
+    subsetRoot: subsetRoot, // NEW
     nullifierHash: deposit.nullifierHash,
     recipient: bigInt(recipient),
     relayer: bigInt(relayerAddress),
@@ -165,24 +182,25 @@ async function generateProof({ deposit, recipient, relayerAddress = 0, fee = 0, 
     secret: deposit.secret,
     pathElements: pathElements,
     pathIndices: pathIndices,
+    subsetPathElements: subsetPathElements // NEW
   }
 
   console.log('Generating SNARK proof')
   console.time('Proof time')
-  const proofData = await websnarkUtils.genWitnessAndProve(groth16, input, circuit, proving_key)
-  const { proof } = websnarkUtils.toSolidityInput(proofData)
+  const { proof, publicSignals } = await snarkjs.groth16.fullProve(input, __dirname + '/../build/circuits/withdraw_js/withdraw.wasm', __dirname + '/../withdraw_final.zkey')
   console.timeEnd('Proof time')
 
-  const args = [
-    toHex(input.root),
-    toHex(input.nullifierHash),
-    toHex(input.recipient, 20),
-    toHex(input.relayer, 20),
-    toHex(input.fee),
-    toHex(input.refund),
-  ]
-
-  return { proof, args }
+  const callData = await snarkjs.groth16.exportSolidityCallData(proof, publicSignals)
+  const json = JSON.parse('[' + callData + ']')
+  
+  return { 
+    proof: {
+      pA: json[0],
+      pB: json[1],
+      pC: json[2]
+    }, 
+    args: json[3] 
+  }
 }
 
 /**
@@ -190,7 +208,7 @@ async function generateProof({ deposit, recipient, relayerAddress = 0, fee = 0, 
  * @param noteString Note to withdraw
  * @param recipient Recipient address
  */
-async function withdraw({ deposit, currency, amount, recipient, relayerURL, refund = '0' }) {
+async function withdraw({ deposit, currency, amount, recipient, relayerURL, refund = '0', blockedCommitments = [] }) {
   if (currency === 'eth' && refund !== '0') {
     throw new Error('The ETH purchase is supposted to be 0 for ETH withdrawals')
   }
@@ -209,7 +227,7 @@ async function withdraw({ deposit, currency, amount, recipient, relayerURL, refu
     if (fee.gt(fromDecimals({ amount, decimals }))) {
       throw new Error('Too high refund')
     }
-    const { proof, args } = await generateProof({ deposit, recipient, relayerAddress, fee, refund })
+    const { proof, args } = await generateProof({ deposit, recipient, relayerAddress, fee, refund, blockedCommitments })
 
     console.log('Sending withdraw transaction through relay')
     try {
@@ -230,10 +248,11 @@ async function withdraw({ deposit, currency, amount, recipient, relayerURL, refu
       }
     }
   } else { // using private key
-    const { proof, args } = await generateProof({ deposit, recipient, refund })
+    // Pass blockedCommitments to proof generation
+    const { proof, args } = await generateProof({ deposit, recipient, refund, blockedCommitments })
 
     console.log('Submitting withdraw transaction')
-    await tornado.methods.withdraw(proof, ...args).send({ from: senderAccount, value: refund.toString(), gas: 1e6 })
+    await tornado.methods.withdraw(proof.pA, proof.pB, proof.pC, ...args).send({ from: senderAccount, value: refund.toString(), gas: 1e6 })
       .on('transactionHash', function (txHash) {
         if (netId === 1 || netId === 42) {
           console.log(`View transaction on etherscan https://${getCurrentNetworkName()}etherscan.io/tx/${txHash}`)
@@ -507,7 +526,7 @@ async function init({ rpc, noteNetId, currency = 'dai', amount = '100' }) {
     erc20tornadoJson = require(__dirname + '/../build/contracts/ERC20Tornado.json')
   }
   // groth16 initialises a lot of Promises that will never be resolved, that's why we need to use process.exit to terminate the CLI
-  groth16 = await buildGroth16()
+  // groth16 = await buildGroth16()
   netId = await web3.eth.net.getId()
   if (noteNetId && Number(noteNetId) !== netId) {
     throw new Error('This note is for a different network. Specify the --rpc option explicitly')
@@ -563,11 +582,24 @@ async function main() {
       })
     program
       .command('withdraw <note> <recipient> [ETH_purchase]')
-      .description('Withdraw a note to a recipient account using relayer or specified private key. You can exchange some of your deposit`s tokens to ETH during the withdrawal by specifing ETH_purchase (e.g. 0.01) to pay for gas in future transactions. Also see the --relayer option.')
-      .action(async (noteString, recipient, refund) => {
+      .option('-b, --blocklist <commitments>', 'Comma-separated list of blocked commitments (hex strings)', '')
+      .description('Withdraw a note. Use --blocklist to specify commitments to exclude from your privacy set.')
+      .action(async (noteString, recipient, refund, cmdObj) => {
         const { currency, amount, netId, deposit } = parseNote(noteString)
+        const blockedCommitments = cmdObj.blocklist ? cmdObj.blocklist.split(',') : []
+        
+        console.log("Using Blocklist:", blockedCommitments);
+
         await init({ rpc: program.rpc, noteNetId: netId, currency, amount })
-        await withdraw({ deposit, currency, amount, recipient, refund, relayerURL: program.relayer })
+        await withdraw({ 
+            deposit, 
+            currency, 
+            amount, 
+            recipient, 
+            refund, 
+            relayerURL: program.relayer,
+            blockedCommitments // Pass this down
+        })
       })
     program
       .command('balance <address> [token_address]')

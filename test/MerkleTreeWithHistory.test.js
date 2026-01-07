@@ -7,9 +7,16 @@ const MerkleTreeWithHistory = artifacts.require('./MerkleTreeWithHistoryMock.sol
 const hasherContract = artifacts.require('./Hasher.sol')
 
 const MerkleTree = require('fixed-merkle-tree')
+const path = require('path')
+const poseidon = require(path.join(__dirname, '../node_modules/fixed-merkle-tree/node_modules/circomlib/src/poseidon.js'))
+const poseidonHash = (...args) => {
+  const inputs = args.length === 1 && Array.isArray(args[0]) ? args[0] : args
+  return poseidon(inputs)
+}
+const ZERO_VALUE = '21663839004416932945382355908790599225266501822907911457504978515578255421292'
 
 const snarkjs = require('snarkjs')
-const bigInt = snarkjs.bigInt
+// const bigInt = snarkjs.bigInt
 
 const { ETH_AMOUNT, MERKLE_TREE_HEIGHT } = process.env
 
@@ -23,7 +30,7 @@ function BNArrayToStringArray(array) {
 }
 
 function toFixedHex(number, length = 32) {
-  let str = bigInt(number).toString(16)
+  let str = (typeof number === 'bigint' ? number.toString(16) : BigInt(number).toString(16))
   while (str.length < length * 2) str = '0' + str
   str = '0x' + str
   return str
@@ -40,7 +47,7 @@ contract('MerkleTreeWithHistory', (accounts) => {
   let tree
 
   before(async () => {
-    tree = new MerkleTree(levels)
+    tree = new MerkleTree(levels, [], { hashFunction: poseidonHash, zeroElement: ZERO_VALUE })
     hasherInstance = await hasherContract.deployed()
     merkleTreeWithHistory = await MerkleTreeWithHistory.new(levels, hasherInstance.address)
     snapshotId = await takeSnapshot()
@@ -119,6 +126,6 @@ contract('MerkleTreeWithHistory', (accounts) => {
     await revertSnapshot(snapshotId.result)
     // eslint-disable-next-line require-atomic-updates
     snapshotId = await takeSnapshot()
-    tree = new MerkleTree(levels)
+    tree = new MerkleTree(levels, [], { hashFunction: poseidonHash, zeroElement: ZERO_VALUE })
   })
 })

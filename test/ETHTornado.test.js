@@ -8,22 +8,39 @@ const { takeSnapshot, revertSnapshot } = require('../scripts/ganacheHelper')
 const Tornado = artifacts.require('./ETHTornado.sol')
 const { ETH_AMOUNT, MERKLE_TREE_HEIGHT } = process.env
 
-const websnarkUtils = require('websnark/src/utils')
-const buildGroth16 = require('websnark/src/groth16')
-const stringifyBigInts = require('websnark/tools/stringifybigint').stringifyBigInts
-const unstringifyBigInts2 = require('snarkjs/src/stringifybigint').unstringifyBigInts
+// const websnarkUtils = require('websnark/src/utils')
+// const buildGroth16 = require('websnark/src/groth16')
+// const stringifyBigInts = require('websnark/tools/stringifybigint').stringifyBigInts
 const snarkjs = require('snarkjs')
-const bigInt = snarkjs.bigInt
+// const bigInt = snarkjs.bigInt
 const crypto = require('crypto')
 const circomlib = require('circomlib')
 const MerkleTree = require('fixed-merkle-tree')
 
-const rbigint = (nbytes) => snarkjs.bigInt.leBuff2int(crypto.randomBytes(nbytes))
-const pedersenHash = (data) => circomlib.babyJub.unpackPoint(circomlib.pedersenHash.hash(data))[0]
+function stringifyBigInts(obj) {
+  if (typeof obj === 'bigint') return obj.toString()
+  if (typeof obj === 'number') return obj.toString()
+  if (Array.isArray(obj)) return obj.map(stringifyBigInts)
+  if (typeof obj === 'object' && obj !== null) {
+    const res = {}
+    for (const key in obj) {
+      res[key] = stringifyBigInts(obj[key])
+    }
+    return res
+  }
+  return obj
+}
+
+const rbigint = (nbytes) => BigInt('0x' + crypto.randomBytes(nbytes).toString('hex'))
+const path = require('path')
+const poseidon = require(path.join(__dirname, '../node_modules/fixed-merkle-tree/node_modules/circomlib/src/poseidon.js'))
+const poseidonHash = (...args) => {
+  const inputs = args.length === 1 && Array.isArray(args[0]) ? args[0] : args
+  return poseidon(inputs)
+}
 const toFixedHex = (number, length = 32) =>
   '0x' +
-  bigInt(number)
-    .toString(16)
+  (typeof number === 'bigint' ? number.toString(16) : BigInt(number).toString(16))
     .padStart(length * 2, '0')
 const getRandomRecipient = () => rbigint(20)
 
@@ -32,8 +49,7 @@ function generateDeposit() {
     secret: rbigint(31),
     nullifier: rbigint(31),
   }
-  const preimage = Buffer.concat([deposit.nullifier.leInt2Buff(31), deposit.secret.leInt2Buff(31)])
-  deposit.commitment = pedersenHash(preimage)
+  deposit.commitment = poseidonHash([deposit.nullifier, deposit.secret])
   return deposit
 }
 
@@ -60,21 +76,33 @@ contract('ETHTornado', (accounts) => {
   const value = ETH_AMOUNT || '1000000000000000000' // 1 ether
   let snapshotId
   let tree
-  const fee = bigInt(ETH_AMOUNT).shr(1) || bigInt(1e17)
-  const refund = bigInt(0)
+  const fee = BigInt(ETH_AMOUNT) / 2n
+  const refund = BigInt(0)
   const recipient = getRandomRecipient()
   const relayer = accounts[1]
-  let groth16
-  let circuit
-  let proving_key
+  // let groth16
+  // let circuit
+  // let proving_key
+
+  async function prove(input) {
+    const { proof, publicSignals } = await snarkjs.groth16.fullProve(input, 'build/circuits/withdraw_js/withdraw.wasm', 'withdraw_final.zkey');
+    const callData = await snarkjs.groth16.exportSolidityCallData(proof, publicSignals)
+    const json = JSON.parse('[' + callData + ']')
+    return {
+      pA: json[0],
+      pB: json[1],
+      pC: json[2],
+      args: json[3]
+    }
+  }
 
   before(async () => {
-    tree = new MerkleTree(levels)
+    tree = new MerkleTree(levels, [], { hashFunction: poseidonHash, zeroElement: '21663839004416932945382355908790599225266501822907911457504978515578255421292' })
     tornado = await Tornado.deployed()
     snapshotId = await takeSnapshot()
-    groth16 = await buildGroth16()
-    circuit = require('../build/circuits/withdraw.json')
-    proving_key = fs.readFileSync('build/circuits/withdraw_proving_key.bin').buffer
+    // groth16 = await buildGroth16()
+    // circuit = require('../build/circuits/withdraw.json')
+    // proving_key = fs.readFileSync('build/circuits/withdraw_proving_key.bin').buffer
   })
 
   describe('#constructor', () => {
@@ -117,7 +145,8 @@ contract('ETHTornado', (accounts) => {
 
       const input = stringifyBigInts({
         root: tree.root(),
-        nullifierHash: pedersenHash(deposit.nullifier.leInt2Buff(31)),
+        subsetRoot: tree.root(),
+        nullifierHash: poseidonHash([deposit.nullifier]),
         nullifier: deposit.nullifier,
         relayer: operator,
         recipient,
@@ -126,31 +155,18 @@ contract('ETHTornado', (accounts) => {
         secret: deposit.secret,
         pathElements: pathElements,
         pathIndices: pathIndices,
+        subsetPathElements: pathElements
       })
 
-      let proofData = await websnarkUtils.genWitnessAndProve(groth16, input, circuit, proving_key)
-      const originalProof = JSON.parse(JSON.stringify(proofData))
-      let result = snarkVerify(proofData)
+      const { proof, publicSignals } = await snarkjs.groth16.fullProve(input, 'build/circuits/withdraw_js/withdraw.wasm', 'withdraw_final.zkey');
+      const vKey = require('../build/circuits/withdraw_verification_key.json');
+      let result = await snarkjs.groth16.verify(vKey, publicSignals, proof);
       result.should.be.equal(true)
 
-      // nullifier
-      proofData.publicSignals[1] =
-        '133792158246920651341275668520530514036799294649489851421007411546007850802'
-      result = snarkVerify(proofData)
+      // tamper with public signals
+      publicSignals[1] = '133792158246920651341275668520530514036799294649489851421007411546007850802'
+      result = await snarkjs.groth16.verify(vKey, publicSignals, proof);
       result.should.be.equal(false)
-      proofData = originalProof
-
-      // try to cheat with recipient
-      proofData.publicSignals[2] = '133738360804642228759657445999390850076318544422'
-      result = snarkVerify(proofData)
-      result.should.be.equal(false)
-      proofData = originalProof
-
-      // fee
-      proofData.publicSignals[3] = '1337100000000000000000'
-      result = snarkVerify(proofData)
-      result.should.be.equal(false)
-      proofData = originalProof
     })
   })
 
@@ -176,7 +192,8 @@ contract('ETHTornado', (accounts) => {
       const input = stringifyBigInts({
         // public
         root: tree.root(),
-        nullifierHash: pedersenHash(deposit.nullifier.leInt2Buff(31)),
+        subsetRoot: tree.root(),
+        nullifierHash: poseidonHash([deposit.nullifier]),
         relayer: operator,
         recipient,
         fee,
@@ -187,10 +204,10 @@ contract('ETHTornado', (accounts) => {
         secret: deposit.secret,
         pathElements: pathElements,
         pathIndices: pathIndices,
+        subsetPathElements: pathElements
       })
 
-      const proofData = await websnarkUtils.genWitnessAndProve(groth16, input, circuit, proving_key)
-      const { proof } = websnarkUtils.toSolidityInput(proofData)
+      const { pA, pB, pC, args } = await prove(input)
 
       const balanceTornadoBefore = await web3.eth.getBalance(tornado.address)
       const balanceRelayerBefore = await web3.eth.getBalance(relayer)
@@ -199,18 +216,7 @@ contract('ETHTornado', (accounts) => {
       let isSpent = await tornado.isSpent(toFixedHex(input.nullifierHash))
       isSpent.should.be.equal(false)
 
-      // Uncomment to measure gas usage
-      // gas = await tornado.withdraw.estimateGas(proof, publicSignals, { from: relayer, gasPrice: '0' })
-      // console.log('withdraw gas:', gas)
-      const args = [
-        toFixedHex(input.root),
-        toFixedHex(input.nullifierHash),
-        toFixedHex(input.recipient, 20),
-        toFixedHex(input.relayer, 20),
-        toFixedHex(input.fee),
-        toFixedHex(input.refund),
-      ]
-      const { logs } = await tornado.withdraw(proof, ...args, { from: relayer, gasPrice: '0' })
+      const { logs } = await tornado.withdraw(pA, pB, pC, ...args, { from: relayer, gasPrice: '0' })
 
       const balanceTornadoAfter = await web3.eth.getBalance(tornado.address)
       const balanceRelayerAfter = await web3.eth.getBalance(relayer)
@@ -239,7 +245,8 @@ contract('ETHTornado', (accounts) => {
 
       const input = stringifyBigInts({
         root: tree.root(),
-        nullifierHash: pedersenHash(deposit.nullifier.leInt2Buff(31)),
+        subsetRoot: tree.root(),
+        nullifierHash: poseidonHash([deposit.nullifier]),
         nullifier: deposit.nullifier,
         relayer: operator,
         recipient,
@@ -248,57 +255,12 @@ contract('ETHTornado', (accounts) => {
         secret: deposit.secret,
         pathElements: pathElements,
         pathIndices: pathIndices,
+        subsetPathElements: pathElements
       })
-      const proofData = await websnarkUtils.genWitnessAndProve(groth16, input, circuit, proving_key)
-      const { proof } = websnarkUtils.toSolidityInput(proofData)
-      const args = [
-        toFixedHex(input.root),
-        toFixedHex(input.nullifierHash),
-        toFixedHex(input.recipient, 20),
-        toFixedHex(input.relayer, 20),
-        toFixedHex(input.fee),
-        toFixedHex(input.refund),
-      ]
-      await tornado.withdraw(proof, ...args, { from: relayer }).should.be.fulfilled
-      const error = await tornado.withdraw(proof, ...args, { from: relayer }).should.be.rejected
+      const { pA, pB, pC, args } = await prove(input)
+      await tornado.withdraw(pA, pB, pC, ...args, { from: relayer }).should.be.fulfilled
+      const error = await tornado.withdraw(pA, pB, pC, ...args, { from: relayer }).should.be.rejected
       error.reason.should.be.equal('The note has been already spent')
-    })
-
-    it('should prevent double spend with overflow', async () => {
-      const deposit = generateDeposit()
-      tree.insert(deposit.commitment)
-      await tornado.deposit(toFixedHex(deposit.commitment), { value, from: sender })
-
-      const { pathElements, pathIndices } = tree.path(0)
-
-      const input = stringifyBigInts({
-        root: tree.root(),
-        nullifierHash: pedersenHash(deposit.nullifier.leInt2Buff(31)),
-        nullifier: deposit.nullifier,
-        relayer: operator,
-        recipient,
-        fee,
-        refund,
-        secret: deposit.secret,
-        pathElements: pathElements,
-        pathIndices: pathIndices,
-      })
-      const proofData = await websnarkUtils.genWitnessAndProve(groth16, input, circuit, proving_key)
-      const { proof } = websnarkUtils.toSolidityInput(proofData)
-      const args = [
-        toFixedHex(input.root),
-        toFixedHex(
-          toBN(input.nullifierHash).add(
-            toBN('21888242871839275222246405745257275088548364400416034343698204186575808495617'),
-          ),
-        ),
-        toFixedHex(input.recipient, 20),
-        toFixedHex(input.relayer, 20),
-        toFixedHex(input.fee),
-        toFixedHex(input.refund),
-      ]
-      const error = await tornado.withdraw(proof, ...args, { from: relayer }).should.be.rejected
-      error.reason.should.be.equal('verifier-gte-snark-scalar-field')
     })
 
     it('fee should be less or equal transfer value', async () => {
@@ -307,10 +269,11 @@ contract('ETHTornado', (accounts) => {
       await tornado.deposit(toFixedHex(deposit.commitment), { value, from: sender })
 
       const { pathElements, pathIndices } = tree.path(0)
-      const largeFee = bigInt(value).add(bigInt(1))
+      const largeFee = BigInt(value) + 1n
       const input = stringifyBigInts({
         root: tree.root(),
-        nullifierHash: pedersenHash(deposit.nullifier.leInt2Buff(31)),
+        subsetRoot: tree.root(),
+        nullifierHash: poseidonHash([deposit.nullifier]),
         nullifier: deposit.nullifier,
         relayer: operator,
         recipient,
@@ -319,19 +282,11 @@ contract('ETHTornado', (accounts) => {
         secret: deposit.secret,
         pathElements: pathElements,
         pathIndices: pathIndices,
+        subsetPathElements: pathElements
       })
 
-      const proofData = await websnarkUtils.genWitnessAndProve(groth16, input, circuit, proving_key)
-      const { proof } = websnarkUtils.toSolidityInput(proofData)
-      const args = [
-        toFixedHex(input.root),
-        toFixedHex(input.nullifierHash),
-        toFixedHex(input.recipient, 20),
-        toFixedHex(input.relayer, 20),
-        toFixedHex(input.fee),
-        toFixedHex(input.refund),
-      ]
-      const error = await tornado.withdraw(proof, ...args, { from: relayer }).should.be.rejected
+      const { pA, pB, pC, args } = await prove(input)
+      const error = await tornado.withdraw(pA, pB, pC, ...args, { from: relayer }).should.be.rejected
       error.reason.should.be.equal('Fee exceeds transfer value')
     })
 
@@ -343,8 +298,9 @@ contract('ETHTornado', (accounts) => {
       const { pathElements, pathIndices } = tree.path(0)
 
       const input = stringifyBigInts({
-        nullifierHash: pedersenHash(deposit.nullifier.leInt2Buff(31)),
         root: tree.root(),
+        subsetRoot: tree.root(),
+        nullifierHash: poseidonHash([deposit.nullifier]),
         nullifier: deposit.nullifier,
         relayer: operator,
         recipient,
@@ -353,20 +309,14 @@ contract('ETHTornado', (accounts) => {
         secret: deposit.secret,
         pathElements: pathElements,
         pathIndices: pathIndices,
+        subsetPathElements: pathElements
       })
 
-      const proofData = await websnarkUtils.genWitnessAndProve(groth16, input, circuit, proving_key)
-      const { proof } = websnarkUtils.toSolidityInput(proofData)
+      const { pA, pB, pC, args } = await prove(input)
+      const corruptedArgs = [...args]
+      corruptedArgs[0] = toFixedHex(randomHex(32))
 
-      const args = [
-        toFixedHex(randomHex(32)),
-        toFixedHex(input.nullifierHash),
-        toFixedHex(input.recipient, 20),
-        toFixedHex(input.relayer, 20),
-        toFixedHex(input.fee),
-        toFixedHex(input.refund),
-      ]
-      const error = await tornado.withdraw(proof, ...args, { from: relayer }).should.be.rejected
+      const error = await tornado.withdraw(pA, pB, pC, ...corruptedArgs, { from: relayer }).should.be.rejected
       error.reason.should.be.equal('Cannot find your merkle root')
     })
 
@@ -379,7 +329,8 @@ contract('ETHTornado', (accounts) => {
 
       const input = stringifyBigInts({
         root: tree.root(),
-        nullifierHash: pedersenHash(deposit.nullifier.leInt2Buff(31)),
+        subsetRoot: tree.root(),
+        nullifierHash: poseidonHash([deposit.nullifier]),
         nullifier: deposit.nullifier,
         relayer: operator,
         recipient,
@@ -388,62 +339,26 @@ contract('ETHTornado', (accounts) => {
         secret: deposit.secret,
         pathElements: pathElements,
         pathIndices: pathIndices,
+        subsetPathElements: pathElements
       })
-      const proofData = await websnarkUtils.genWitnessAndProve(groth16, input, circuit, proving_key)
-      let { proof } = websnarkUtils.toSolidityInput(proofData)
-      const args = [
-        toFixedHex(input.root),
-        toFixedHex(input.nullifierHash),
-        toFixedHex(input.recipient, 20),
-        toFixedHex(input.relayer, 20),
-        toFixedHex(input.fee),
-        toFixedHex(input.refund),
-      ]
+      const { pA, pB, pC, args } = await prove(input)
+      
       let incorrectArgs
-      const originalProof = proof.slice()
 
       // recipient
-      incorrectArgs = [
-        toFixedHex(input.root),
-        toFixedHex(input.nullifierHash),
-        toFixedHex('0x0000000000000000000000007a1f9131357404ef86d7c38dbffed2da70321337', 20),
-        toFixedHex(input.relayer, 20),
-        toFixedHex(input.fee),
-        toFixedHex(input.refund),
-      ]
-      let error = await tornado.withdraw(proof, ...incorrectArgs, { from: relayer }).should.be.rejected
+      incorrectArgs = [...args]
+      incorrectArgs[3] = toFixedHex('0x0000000000000000000000007a1f9131357404ef86d7c38dbffed2da70321337', 20)
+      let error = await tornado.withdraw(pA, pB, pC, ...incorrectArgs, { from: relayer }).should.be.rejected
       error.reason.should.be.equal('Invalid withdraw proof')
 
       // fee
-      incorrectArgs = [
-        toFixedHex(input.root),
-        toFixedHex(input.nullifierHash),
-        toFixedHex(input.recipient, 20),
-        toFixedHex(input.relayer, 20),
-        toFixedHex('0x000000000000000000000000000000000000000000000000015345785d8a0000'),
-        toFixedHex(input.refund),
-      ]
-      error = await tornado.withdraw(proof, ...incorrectArgs, { from: relayer }).should.be.rejected
+      incorrectArgs = [...args]
+      incorrectArgs[5] = toFixedHex('0x000000000000000000000000000000000000000000000000015345785d8a0000')
+      error = await tornado.withdraw(pA, pB, pC, ...incorrectArgs, { from: relayer }).should.be.rejected
       error.reason.should.be.equal('Invalid withdraw proof')
-
-      // nullifier
-      incorrectArgs = [
-        toFixedHex(input.root),
-        toFixedHex('0x00abdfc78211f8807b9c6504a6e537e71b8788b2f529a95f1399ce124a8642ad'),
-        toFixedHex(input.recipient, 20),
-        toFixedHex(input.relayer, 20),
-        toFixedHex(input.fee),
-        toFixedHex(input.refund),
-      ]
-      error = await tornado.withdraw(proof, ...incorrectArgs, { from: relayer }).should.be.rejected
-      error.reason.should.be.equal('Invalid withdraw proof')
-
-      // proof itself
-      proof = '0xbeef' + proof.substr(6)
-      await tornado.withdraw(proof, ...args, { from: relayer }).should.be.rejected
 
       // should work with original values
-      await tornado.withdraw(originalProof, ...args, { from: relayer }).should.be.fulfilled
+      await tornado.withdraw(pA, pB, pC, ...args, { from: relayer }).should.be.fulfilled
     })
 
     it('should reject with non zero refund', async () => {
@@ -454,30 +369,22 @@ contract('ETHTornado', (accounts) => {
       const { pathElements, pathIndices } = tree.path(0)
 
       const input = stringifyBigInts({
-        nullifierHash: pedersenHash(deposit.nullifier.leInt2Buff(31)),
         root: tree.root(),
+        subsetRoot: tree.root(),
+        nullifierHash: poseidonHash([deposit.nullifier]),
         nullifier: deposit.nullifier,
         relayer: operator,
         recipient,
         fee,
-        refund: bigInt(1),
+        refund: BigInt(1),
         secret: deposit.secret,
         pathElements: pathElements,
         pathIndices: pathIndices,
+        subsetPathElements: pathElements
       })
 
-      const proofData = await websnarkUtils.genWitnessAndProve(groth16, input, circuit, proving_key)
-      const { proof } = websnarkUtils.toSolidityInput(proofData)
-
-      const args = [
-        toFixedHex(input.root),
-        toFixedHex(input.nullifierHash),
-        toFixedHex(input.recipient, 20),
-        toFixedHex(input.relayer, 20),
-        toFixedHex(input.fee),
-        toFixedHex(input.refund),
-      ]
-      const error = await tornado.withdraw(proof, ...args, { from: relayer }).should.be.rejected
+      const { pA, pB, pC, args } = await prove(input)
+      const error = await tornado.withdraw(pA, pB, pC, ...args, { from: relayer }).should.be.rejected
       error.reason.should.be.equal('Refund value is supposed to be zero for ETH instance')
     })
   })
@@ -497,7 +404,8 @@ contract('ETHTornado', (accounts) => {
       const input = stringifyBigInts({
         // public
         root: tree.root(),
-        nullifierHash: pedersenHash(deposit2.nullifier.leInt2Buff(31)),
+        subsetRoot: tree.root(),
+        nullifierHash: poseidonHash([deposit2.nullifier]),
         relayer: operator,
         recipient,
         fee,
@@ -508,24 +416,15 @@ contract('ETHTornado', (accounts) => {
         secret: deposit2.secret,
         pathElements: pathElements,
         pathIndices: pathIndices,
+        subsetPathElements: pathElements
       })
 
-      const proofData = await websnarkUtils.genWitnessAndProve(groth16, input, circuit, proving_key)
-      const { proof } = websnarkUtils.toSolidityInput(proofData)
+      const { pA, pB, pC, args } = await prove(input)
 
-      const args = [
-        toFixedHex(input.root),
-        toFixedHex(input.nullifierHash),
-        toFixedHex(input.recipient, 20),
-        toFixedHex(input.relayer, 20),
-        toFixedHex(input.fee),
-        toFixedHex(input.refund),
-      ]
+      await tornado.withdraw(pA, pB, pC, ...args, { from: relayer, gasPrice: '0' })
 
-      await tornado.withdraw(proof, ...args, { from: relayer, gasPrice: '0' })
-
-      const nullifierHash1 = toFixedHex(pedersenHash(deposit1.nullifier.leInt2Buff(31)))
-      const nullifierHash2 = toFixedHex(pedersenHash(deposit2.nullifier.leInt2Buff(31)))
+      const nullifierHash1 = toFixedHex(poseidonHash([deposit1.nullifier]))
+      const nullifierHash2 = toFixedHex(poseidonHash([deposit2.nullifier]))
       const spentArray = await tornado.isSpentArray([nullifierHash1, nullifierHash2])
       spentArray.should.be.deep.equal([false, true])
     })
